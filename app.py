@@ -23,7 +23,9 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
-DEFAULT_MODEL = "gemini-2.5-flash"  # change in secrets/env with GEMINI_MODEL
+DEFAULT_MODEL = "gemini-3.8-flash"  # change in secrets/env with GEMINI_MODEL
+# If the chosen model is retired (404), these are tried in order.
+FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-flash-latest"]
 MAX_FILE_MB = 5
 MAX_CHARS = 15000  # resume text sent to the model is truncated to this length
 MIN_CHARS = 200  # below this we assume the file is scanned / empty
@@ -189,17 +191,35 @@ def normalise_result(data: dict) -> dict:
     }
 
 
+def _is_model_not_found(err: Exception) -> bool:
+    msg = str(err)
+    return "404" in msg or "NOT_FOUND" in msg or "no longer available" in msg
+
+
 def analyse_resume(api_key: str, model: str, resume_text: str, job_description: str) -> dict:
+    """Call Gemini. If the model is unavailable (404), try the fallback models."""
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=build_prompt(resume_text, job_description),
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
-    )
-    return normalise_result(parse_json_response(response.text))
+    prompt = build_prompt(resume_text, job_description)
+    candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
+
+    last_error = None
+    for name in candidates:
+        try:
+            response = client.models.generate_content(
+                model=name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                ),
+            )
+            return normalise_result(parse_json_response(response.text))
+        except Exception as e:
+            if _is_model_not_found(e):
+                last_error = e
+                continue
+            raise
+    raise RuntimeError(f"No available Gemini model found. Last error: {last_error}")
 
 
 # --------------------------------------------------------------------------
