@@ -13,6 +13,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -26,6 +27,10 @@ from pypdf import PdfReader
 DEFAULT_MODEL = "gemini-3.8-flash"  # change in secrets/env with GEMINI_MODEL
 # If the chosen model is retired (404), these are tried in order.
 FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-flash-latest"]
+RETRIES_PER_MODEL = 3  # attempts per model when Google is busy (503/429/500/504)
+RETRY_BASE_DELAY = 2  # seconds; doubles each retry (2s, 4s)
+RETRIES_PER_MODEL = 3  # attempts per model when Google is overloaded (503/429)
+RETRY_WAIT_SECONDS = 2  # doubles after each failed attempt: 2s, 4s, ...
 MAX_FILE_MB = 5
 MAX_CHARS = 15000  # resume text sent to the model is truncated to this length
 MIN_CHARS = 200  # below this we assume the file is scanned / empty
@@ -196,30 +201,59 @@ def _is_model_not_found(err: Exception) -> bool:
     return "404" in msg or "NOT_FOUND" in msg or "no longer available" in msg
 
 
-def analyse_resume(api_key: str, model: str, resume_text: str, job_description: str) -> dict:
-    """Call Gemini. If the model is unavailable (404), try the fallback models."""
+def _is_transient(err: Exception) -> bool:
+    """Temporary problems worth retrying: overload, rate limit, timeouts, bad JSON."""
+    if isinstance(err, ValueError):  # model returned unparsable output
+        return True
+    msg = str(err).upper()
+    markers = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL",
+               "504", "DEADLINE", "OVERLOADED", "HIGH DEMAND", "TIMEOUT", "TIMED OUT",
+               "CONNECTION")
+    return any(m in msg for m in markers)
+
+
+def analyse_resume(api_key: str, model: str, resume_text: str, job_description: str,
+                   status=None) -> dict:
+    """
+    Call Gemini robustly:
+      * transient errors (503 etc.) are retried with exponential backoff
+      * if a model stays busy or is retired (404), the next fallback model is tried
+      * real errors (bad API key, bad request) are raised immediately
+    `status` is an optional callable(str) used to show progress in the UI.
+    """
     client = genai.Client(api_key=api_key)
     prompt = build_prompt(resume_text, job_description)
     candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
+    notify = status or (lambda _msg: None)
 
     last_error = None
     for name in candidates:
-        try:
-            response = client.models.generate_content(
-                model=name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.2,
-                    response_mime_type="application/json",
-                ),
-            )
-            return normalise_result(parse_json_response(response.text))
-        except Exception as e:
-            if _is_model_not_found(e):
+        for attempt in range(1, RETRIES_PER_MODEL + 1):
+            try:
+                notify(f"Analysing with {name} (attempt {attempt}/{RETRIES_PER_MODEL})...")
+                response = client.models.generate_content(
+                    model=name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.2,
+                        response_mime_type="application/json",
+                    ),
+                )
+                return normalise_result(parse_json_response(response.text))
+            except Exception as e:
                 last_error = e
-                continue
-            raise
-    raise RuntimeError(f"No available Gemini model found. Last error: {last_error}")
+                if _is_model_not_found(e):
+                    break  # this model is gone, move to the next one
+                if not _is_transient(e):
+                    raise  # e.g. invalid API key: retrying will not help
+                if attempt < RETRIES_PER_MODEL:
+                    notify(f"Gemini is busy, retrying in {RETRY_BASE_DELAY * 2 ** (attempt - 1)}s...")
+                    time.sleep(RETRY_BASE_DELAY * 2 ** (attempt - 1))
+                # after the last attempt, fall through to the next model
+    raise RuntimeError(
+        "Gemini is overloaded or unavailable right now, even after retries and trying "
+        f"other models. Please wait a minute and click Analyse again. (Last error: {last_error})"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -361,10 +395,14 @@ def main() -> None:
             )
             st.stop()
 
+        status_box = st.empty()
         try:
             with st.spinner("Analysing with Gemini..."):
-                result = analyse_resume(api_key, model.strip() or DEFAULT_MODEL, text, job_description)
+                result = analyse_resume(api_key, model.strip() or DEFAULT_MODEL, text,
+                                        job_description, status=status_box.caption)
+            status_box.empty()
         except Exception as e:
+            status_box.empty()
             st.error(f"Analysis failed: {e}")
             st.stop()
 
