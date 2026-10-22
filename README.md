@@ -29,7 +29,7 @@ Get a free API key from [Google AI Studio](https://aistudio.google.com/apikey), 
 **Option A - secrets file** (recommended). Create `.streamlit/secrets.toml`:
 ```toml
 GEMINI_API_KEY = "your-key-here"
-# GEMINI_MODEL = "gemini-2.5-flash"   # optional
+# GEMINI_MODEL = "gemini-3.8-flash"   # optional
 ```
 
 **Option B** - leave it empty and paste the key into the app's sidebar.
@@ -58,4 +58,4 @@ streamlit run app.py
 - Scanned/image-only PDFs have no extractable text and will be rejected. Use a text-based PDF or DOCX.
 - The ATS score is an AI estimate, not the output of a real ATS. Use it as guidance.
 - Resumes are sent to the Gemini API. Do not upload documents you are not comfortable sharing.
-- Model names change over time; set `GEMINI_MODEL` if the default is retired.# ai-resume-checker
+- Model names change over time. The app defaults to `gemini-3.8-flash` and automatically falls back to other Flash models if it gets a 404; you can also set `GEMINI_MODEL` yourself.
