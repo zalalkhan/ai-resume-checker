@@ -13,6 +13,7 @@ Built with **Streamlit** and **Google Gemini Flash**.
 - Before/after bullet rewrites
 - Instant rule-based checks (email, phone, LinkedIn, sections, word count)
 - Downloadable JSON report
+- Never dead-ends: if Gemini is overloaded (503), the app retries, tries other models, and finally shows an offline rule-based analysis
 
 ## Run locally
 
@@ -45,6 +46,14 @@ streamlit run app.py
 3. Click **Create app**, pick your repo, branch `main`, main file `app.py`.
 4. Open **Advanced settings → Secrets** and paste: `GEMINI_API_KEY = "your-key-here"`
 5. Click **Deploy**.
+
+## Troubleshooting
+| Problem | What to do |
+|---|---|
+| `503 UNAVAILABLE / high demand` | Google-side overload. The app retries and tries Lite models automatically, then falls back to an offline analysis. Click **Analyse** again in a few minutes for the full AI review. |
+| `404 NOT_FOUND` for a model | The model was retired. The app skips to the next one. Use **Check available models** in the sidebar to see what your key can use, and set `GEMINI_MODEL`. |
+| `API key not valid` | Create a new key at https://aistudio.google.com/apikey and update the secret. |
+| `429 RESOURCE_EXHAUSTED` | Free-tier rate limit; wait a minute. |
 
 ## Project structure
 ```
