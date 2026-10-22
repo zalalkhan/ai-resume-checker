@@ -25,12 +25,19 @@ from pypdf import PdfReader
 # Config
 # --------------------------------------------------------------------------
 DEFAULT_MODEL = "gemini-3.8-flash"  # change in secrets/env with GEMINI_MODEL
-# If the chosen model is retired (404), these are tried in order.
-FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-flash-latest"]
-RETRIES_PER_MODEL = 3  # attempts per model when Google is busy (503/429/500/504)
-RETRY_BASE_DELAY = 2  # seconds; doubles each retry (2s, 4s)
-RETRIES_PER_MODEL = 3  # attempts per model when Google is overloaded (503/429)
-RETRY_WAIT_SECONDS = 2  # doubles after each failed attempt: 2s, 4s, ...
+# Tried in order when a model is busy (503/429) or retired (404). Lite models run on
+# separate capacity and are often available when the big Flash models are overloaded.
+FALLBACK_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+]
+RETRIES_PER_MODEL = 2  # attempts per model when Google is busy (503/429/500/504)
+RETRY_BASE_DELAY = 3  # seconds; doubles each retry
 MAX_FILE_MB = 5
 MAX_CHARS = 15000  # resume text sent to the model is truncated to this length
 MIN_CHARS = 200  # below this we assume the file is scanned / empty
@@ -212,6 +219,10 @@ def _is_transient(err: Exception) -> bool:
     return any(m in msg for m in markers)
 
 
+class GeminiBusyError(RuntimeError):
+    """Raised when every model stayed overloaded/unavailable after retries."""
+
+
 def analyse_resume(api_key: str, model: str, resume_text: str, job_description: str,
                    status=None) -> dict:
     """
@@ -250,10 +261,132 @@ def analyse_resume(api_key: str, model: str, resume_text: str, job_description: 
                     notify(f"Gemini is busy, retrying in {RETRY_BASE_DELAY * 2 ** (attempt - 1)}s...")
                     time.sleep(RETRY_BASE_DELAY * 2 ** (attempt - 1))
                 # after the last attempt, fall through to the next model
-    raise RuntimeError(
+    raise GeminiBusyError(
         "Gemini is overloaded or unavailable right now, even after retries and trying "
         f"other models. Please wait a minute and click Analyse again. (Last error: {last_error})"
     )
+
+
+# --------------------------------------------------------------------------
+# Offline fallback analyser (no AI): used when Gemini is unavailable
+# --------------------------------------------------------------------------
+ACTION_VERBS = {
+    "achieved", "built", "created", "delivered", "designed", "developed", "drove", "improved",
+    "increased", "reduced", "led", "managed", "launched", "optimized", "optimised", "automated",
+    "implemented", "analyzed", "analysed", "streamlined", "negotiated", "mentored", "deployed",
+    "engineered", "generated", "saved", "scaled", "owned", "established", "coordinated",
+}
+STOPWORDS = {
+    "the", "and", "for", "with", "you", "our", "are", "will", "have", "this", "that", "from",
+    "your", "who", "able", "work", "team", "years", "year", "experience", "ability", "strong",
+    "skills", "role", "job", "must", "should", "including", "such", "their", "into", "all",
+    "can", "per", "etc", "using", "use", "new", "also", "more", "other", "than", "has", "its",
+}
+
+
+def jd_keywords(job_description: str, limit: int = 25) -> list:
+    words = re.findall(r"[A-Za-z][A-Za-z+#.\-]{2,}", job_description.lower())
+    counts = {}
+    for w in words:
+        w = w.strip(".-")
+        if len(w) > 2 and w not in STOPWORDS:
+            counts[w] = counts.get(w, 0) + 1
+    ranked = sorted(counts, key=lambda k: (-counts[k], k))
+    return ranked[:limit]
+
+
+def offline_analysis(resume_text: str, job_description: str = "") -> dict:
+    """Heuristic ATS estimate. Less insightful than the AI version, but always works."""
+    checks = basic_checks(resume_text)
+    lower = resume_text.lower()
+    lines = [ln.strip() for ln in resume_text.splitlines() if ln.strip()]
+    bullets = [ln for ln in lines if re.match(r"^[-*\u2022\u25aa\u25cf>]\s*\S", ln)]
+    metrics = re.findall(r"\d+(?:\.\d+)?\s*%|[$\u20b9\u00a3\u20ac]\s*\d|\b\d{2,}\b", resume_text)
+    verbs_used = {v for v in ACTION_VERBS if re.search(rf"\b{v}\b", lower)}
+    words = checks["word_count"]
+    found_sections = sum(checks["sections"].values())
+
+    # formatting: contact info + core sections
+    formatting = 30 + 15 * checks["email"] + 10 * checks["phone"] + 5 * checks["linkedin"]
+    formatting += 8 * sum(checks["sections"][k] for k in ("Experience", "Education", "Skills"))
+    # readability: sensible length
+    if 400 <= words <= 800:
+        readability = 90
+    elif 250 <= words < 400 or 800 < words <= 1000:
+        readability = 70
+    else:
+        readability = 45
+    experience = min(100, 35 + 4 * len(metrics) + 5 * len(verbs_used) + 2 * len(bullets))
+    skills = 80 if checks["sections"]["Skills"] else 40
+    education = 80 if checks["sections"]["Education"] else 40
+
+    missing, keywords = [], 0
+    if job_description.strip():
+        jd_words = jd_keywords(job_description)
+        hits = [w for w in jd_words if re.search(rf"(?<![a-z]){re.escape(w)}(?![a-z])", lower)]
+        missing = [w for w in jd_words if w not in hits][:10]
+        keywords = int(100 * len(hits) / len(jd_words)) if jd_words else 50
+    else:
+        keywords = min(100, 40 + 6 * len(verbs_used) + 3 * found_sections)
+
+    section_scores = {
+        "formatting": formatting, "keywords": keywords, "experience": experience,
+        "skills": skills, "education": education, "readability": readability,
+    }
+    weights = {"formatting": .2, "keywords": .3, "experience": .25, "skills": .1,
+               "education": .05, "readability": .1}
+    overall = sum(clamp_score(section_scores[k]) * w for k, w in weights.items())
+
+    strengths, weaknesses, improvements = [], [], []
+
+    def add(priority, issue, fix):
+        weaknesses.append(issue)
+        improvements.append({"priority": priority, "issue": issue, "fix": fix})
+
+    if checks["email"] and checks["phone"]:
+        strengths.append("Email and phone number are present and readable.")
+    if found_sections >= 4:
+        strengths.append("Standard resume sections are clearly labelled.")
+    if len(metrics) >= 5:
+        strengths.append("Includes quantified achievements (numbers and percentages).")
+    if len(verbs_used) >= 5:
+        strengths.append("Uses strong action verbs.")
+
+    if not checks["email"]:
+        add("High", "No email address detected", "Add a professional email near the top.")
+    if not checks["phone"]:
+        add("Medium", "No phone number detected", "Add a phone number in the header.")
+    for name in ("Experience", "Education", "Skills"):
+        if not checks["sections"][name]:
+            add("High", f"No '{name}' heading detected",
+                f"Add a clearly labelled '{name}' section; ATS software looks for standard headings.")
+    if len(metrics) < 3:
+        add("High", "Few measurable results", "Add numbers: %, revenue, users, time saved, team size.")
+    if len(verbs_used) < 4:
+        add("Medium", "Weak or missing action verbs",
+            "Start bullets with verbs such as Built, Led, Reduced, Delivered, Automated.")
+    if words < 250:
+        add("Medium", "Resume is very short", "Expand your experience and projects to 400-800 words.")
+    elif words > 1000:
+        add("Medium", "Resume is very long", "Trim to 1-2 pages; keep the most relevant roles.")
+    if not bullets:
+        add("Low", "No bullet points detected", "Use short bullet points for achievements under each role.")
+    if missing:
+        add("High", "Missing keywords from the job description",
+            "Work these in naturally where truthful: " + ", ".join(missing))
+
+    return normalise_result({
+        "overall_score": overall,
+        "section_scores": section_scores,
+        "summary": ("Offline estimate based on rules (contact info, sections, length, action verbs, "
+                    "metrics" + (", job-description keywords" if job_description.strip() else "") +
+                    "). Run again later for the full AI review."),
+        "strengths": strengths or ["No clear strengths detected by the offline checker."],
+        "weaknesses": weaknesses,
+        "missing_keywords": missing,
+        "improvements": improvements,
+        "rewritten_bullets": [],
+    })
 
 
 # --------------------------------------------------------------------------
@@ -359,6 +492,14 @@ def main() -> None:
         else:
             st.success("API key loaded from secrets.")
         model = st.text_input("Model", value=get_secret("GEMINI_MODEL", DEFAULT_MODEL))
+        if api_key and st.button("Check available models"):
+            try:
+                names = [m.name.replace("models/", "") for m in genai.Client(api_key=api_key).models.list()]
+                flash = sorted(n for n in names if "flash" in n)
+                st.write("Flash models on your key:")
+                st.code("\n".join(flash) or "none found")
+            except Exception as e:
+                st.error(f"Could not list models: {e}")
         st.markdown("---")
         st.caption("Your resume is sent to Google's Gemini API for analysis. "
                    "Do not upload documents you are not comfortable sharing.")
@@ -396,11 +537,19 @@ def main() -> None:
             st.stop()
 
         status_box = st.empty()
+        st.session_state["offline"] = False
         try:
             with st.spinner("Analysing with Gemini..."):
                 result = analyse_resume(api_key, model.strip() or DEFAULT_MODEL, text,
                                         job_description, status=status_box.caption)
             status_box.empty()
+        except GeminiBusyError as e:
+            status_box.empty()
+            st.warning("Gemini is overloaded right now, so this is a basic offline analysis "
+                       "instead of the full AI review. Click Analyse again in a few minutes "
+                       "for AI-powered feedback.")
+            result = offline_analysis(text, job_description)
+            st.session_state["offline"] = True
         except Exception as e:
             status_box.empty()
             st.error(f"Analysis failed: {e}")
@@ -410,6 +559,8 @@ def main() -> None:
         st.session_state["checks"] = basic_checks(text)
 
     if "result" in st.session_state:
+        if st.session_state.get("offline"):
+            st.warning("Showing offline (rule-based) results because Gemini was unavailable.")
         render_result(st.session_state["result"])
         st.divider()
         render_basic_checks(st.session_state["checks"])
