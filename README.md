@@ -58,4 +58,5 @@ streamlit run app.py
 - Scanned/image-only PDFs have no extractable text and will be rejected. Use a text-based PDF or DOCX.
 - The ATS score is an AI estimate, not the output of a real ATS. Use it as guidance.
 - Resumes are sent to the Gemini API. Do not upload documents you are not comfortable sharing.
-- Model names change over time. The app defaults to `gemini-3.8-flash` and automatically falls back to other Flash models if it gets a 404; you can also set `GEMINI_MODEL` yourself.
+- If Google returns a temporary "503 high demand" or rate-limit error, the app retries with a short wait and then tries backup models before giving up.
+- Model names change over time. The app defaults to `gemini-3.8-flash` and retries with backoff when Google returns 503/429 (high demand), and falls back to other Flash models if a model is busy or retired (404); you can also set `GEMINI_MODEL` yourself.
